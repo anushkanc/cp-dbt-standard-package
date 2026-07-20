@@ -120,7 +120,7 @@
 
     {% set tag_name = ns.matching_tag %}
 
-    {# Validate allowed values #}
+    {# Validate allowed values 2 #}
     {% if ns.allowed_values | length > 0 %}
         {% set val_ns = namespace(is_valid=false, matched_value="") %}
 
