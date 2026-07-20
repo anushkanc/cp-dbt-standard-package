@@ -222,8 +222,51 @@
 
 
 {# ============================================================
+   RESOLVE LAYER DEPLOY ROLE
+   Given a model's target database, return the deploy role that owns
+   objects in that layer:
+     • CON role for databases whose name contains '_CON' (e.g. MD_CON_PD)
+     • CUR role for every other database (default layer)
+
+   Required when secondary roles are disabled on the deploy user:
+   the primary role must own the target object for ALTER … SET TAG,
+   so we USE ROLE the correct layer before applying tags.
+
+   Env vars (mirrors snowflake__create_schema convention):
+     • DBT_SF_CUR_DEPLOY_ROLE — session default; presence enables switching
+     • DBT_SF_CON_DEPLOY_ROLE — optional, falls back to CUR role
+       (CUR-only / divisional repos leave this unset)
+
+   Returns none when DBT_SF_CUR_DEPLOY_ROLE is unset, which signals
+   callers to skip role switching entirely (backward-compat with
+   environments that predate the disabled-secondary-roles rollout).
+   ============================================================ #}
+{% macro resolve_layer_deploy_role(database) %}
+    {% set cur_role = env_var('DBT_SF_CUR_DEPLOY_ROLE', '') %}
+    {% if not cur_role %}
+        {{ return(none) }}
+    {% endif %}
+    {% set con_role = env_var('DBT_SF_CON_DEPLOY_ROLE', cur_role) %}
+    {% set target_role = con_role if '_CON' in (database | upper) else cur_role %}
+    {{ return(target_role) }}
+{% endmacro %}
+
+
+{# ============================================================
    PROCESS TAGGING AT END OF RUN
    Supports: alias, materialization-based relation type, dual tag location (config/meta)
+
+   Per-layer role switching (DPB-2513 follow-up):
+     With secondary roles disabled on the deploy user, ALTER … SET TAG
+     requires the *primary* role to own the target object. A single
+     dbt build can materialize objects across both CUR and CON layers,
+     so we USE ROLE the appropriate layer-owning role before each
+     model's tags are applied and restore the original session role
+     at the end so subsequent on-run-end steps (e.g.
+     call_certified_read_proc) see the role they started with.
+
+     Switching is a no-op when DBT_SF_CUR_DEPLOY_ROLE is unset —
+     preserves behaviour for older deploy environments.
    ============================================================ #}
 {% macro tag_models_on_run_end(changed_models=None) %}
     {{ log("Starting tag application process", info=true) }}
@@ -240,6 +283,27 @@
         {% set models_to_tag = changed_models %}
     {% endif %}
 
+    {# ── Capture session role once so we can restore it after per-layer switches ──
+       Parse-phase guard (`execute`): run_query() returns None during dbt parse,
+       so accessing .columns on the result would crash. This macro is a public
+       entry point (callable directly from on-run-end with `changed_models`),
+       so we can't assume the caller's `execute` guard — mirror the same
+       pattern used in get_snowflake_tags above. #}
+    {% set role_ns = namespace(switching_enabled=false, original_role=none, active_role=none) %}
+    {% if execute and models_to_tag | length > 0 and env_var('DBT_SF_CUR_DEPLOY_ROLE', '') %}
+        {% set role_ns.switching_enabled = true %}
+        {% set current_role_result = run_query('SELECT CURRENT_ROLE()') %}
+        {% set role_ns.original_role = current_role_result.columns[0].values()[0] %}
+        {% set role_ns.active_role = role_ns.original_role %}
+        {{ log("[tag_models_on_run_end] captured session role: " ~ role_ns.original_role, info=true) }}
+    {% elif execute and models_to_tag | length > 0 %}
+        {{ log(
+            "[tag_models_on_run_end] DBT_SF_CUR_DEPLOY_ROLE unset — "
+            ~ "skipping per-layer role switching (all tags applied under current session role).",
+            info=true
+        ) }}
+    {% endif %}
+
     {% for node_id in models_to_tag %}
         {% if node_id in graph.nodes %}
             {% set node = graph.nodes[node_id] %}
@@ -254,6 +318,21 @@
                 {% set rel_type = 'VIEW' if mat == 'view' else 'TABLE' %}
 
                 {{ log("Processing model: " ~ model_database ~ "." ~ model_schema ~ "." ~ model_name, info=true) }}
+
+                {# ── Switch to the deploy role that owns this model's layer ── #}
+                {% if role_ns.switching_enabled %}
+                    {% set target_role = cp_dbt_standard_package.resolve_layer_deploy_role(model_database) %}
+                    {% if target_role and target_role != role_ns.active_role %}
+                        {{ log(
+                            "[tag_models_on_run_end] switching role: "
+                            ~ role_ns.active_role ~ " → " ~ target_role
+                            ~ " (for " ~ model_database ~ ")",
+                            info=true
+                        ) }}
+                        {% do run_query('USE ROLE ' ~ target_role) %}
+                        {% set role_ns.active_role = target_role %}
+                    {% endif %}
+                {% endif %}
 
                 {# Table-level tags — check both config.snowflake_tags and config.meta.snowflake_tags #}
                 {% set model_tags = node.config.get('snowflake_tags', {}) %}
@@ -280,6 +359,16 @@
             {% endif %}
         {% endif %}
     {% endfor %}
+
+    {# ── Restore original session role so downstream on-run-end steps see it ── #}
+    {% if role_ns.switching_enabled and role_ns.active_role != role_ns.original_role %}
+        {{ log(
+            "[tag_models_on_run_end] restoring session role: "
+            ~ role_ns.active_role ~ " → " ~ role_ns.original_role,
+            info=true
+        ) }}
+        {% do run_query('USE ROLE ' ~ role_ns.original_role) %}
+    {% endif %}
 
     {{ log("Tag application process completed.", info=true) }}
 {% endmacro %}
